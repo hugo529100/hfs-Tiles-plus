@@ -1,44 +1,148 @@
 'use strict'; {
 
-    const config = typeof HFS !== 'undefined' && HFS.pluginConfig
-        ? HFS.pluginConfig
-        : {};
+    // 原名 Short-plus，現更名為 Tiles-plus。
+    // localStorage key 仍是 'short-folder-tile-mode'，讓舊的每資料夾記憶無痛沿用。
+
+    // HFS 只會把標記 frontend: true 的設定透過 HFS.getPluginConfig() 傳給前端。
+    // 必須在 script 最上層同步呼叫（HFS 靠 currentScript 判斷是哪個外掛）。
+    function readPluginConfig() {
+        if (typeof HFS === 'undefined') return {};
+        try {
+            if (typeof HFS.getPluginConfig === 'function') {
+                const cfg = HFS.getPluginConfig();
+                if (cfg && typeof cfg === 'object') return cfg;
+            }
+        } catch (e) {}
+        return (HFS.pluginConfig && typeof HFS.pluginConfig === 'object') ? HFS.pluginConfig : {};
+    }
+
+    const config = readPluginConfig();
 
     const ENABLE_ENHANCED_SORTING = config.enableEnhancedSorting !== false;
     const ENABLE_TILE_MODE_MEMORY = config.enableTileModeMemory !== false;
-    const EXPIRE_HOURS = config.expireHours ?? 24;
-    const EXPIRE = EXPIRE_HOURS === 0 ? Infinity : EXPIRE_HOURS * 60 * 60 * 1000;
 
-    // Only trust the server-provided tile size when memory is actually enabled.
-    const SERVER_TILE_SIZE = ENABLE_TILE_MODE_MEMORY ? config.serverTileSize : undefined;
+    // ==================== Tile size memory ====================
+    // 這裡是 tile 尺寸記憶系統的唯一擁有者（由 Hotkey 搬過來合併）：
+    //   - 每個資料夾記住一個尺寸（localStorage）
+    //   - 過期清理
+    //   - 預設尺寸：直接採用 HFS config.yaml 的 tile_size
+    //   - 套用尺寸並同步 #option-tile-size 控制項
+    // 鍵盤快捷鍵仍留在 Hotkey，透過 HFS.short.tile.setSize() 呼叫這裡。
+
+    const TILE_MIN = 0;
+    const TILE_MAX = 10;
+    const TILE_LAST_RESORT_DEFAULT = 2;
+
+    function clampTileSize(value, fallback) {
+        // null / undefined / '' / true-false 都不是合法尺寸（0 是合法的清單模式）。
+        if (value === null || value === undefined || value === '' || typeof value === 'boolean') {
+            return fallback;
+        }
+        const n = Number(value);
+        if (!isFinite(n)) return fallback;
+        return Math.max(TILE_MIN, Math.min(TILE_MAX, Math.round(n)));
+    }
+
+    // 未設定時沿用舊行為：24 小時。
+    const RAW_EXPIRE_HOURS = config.expireHours;
+    const EXPIRE_HOURS = (RAW_EXPIRE_HOURS === undefined || RAW_EXPIRE_HOURS === null || RAW_EXPIRE_HOURS === '')
+        ? 24
+        : Number(RAW_EXPIRE_HOURS);
+    const EXPIRE = !isFinite(EXPIRE_HOURS) || EXPIRE_HOURS <= 0
+        ? Infinity
+        : EXPIRE_HOURS * 60 * 60 * 1000;
+
+    // HFS 開機資料的 tile_size 就是 config.yaml 的 tile_size（0..10）。
+    // 這是唯一的預設來源；只有它不存在時才退回 state，最後才用 2。
+    function readHfsDefaultTileSize() {
+        if (typeof HFS === 'undefined') return undefined;
+        const fromBoot = clampTileSize(HFS.tile_size, undefined);
+        if (fromBoot !== undefined) return fromBoot;
+        return HFS.state ? clampTileSize(HFS.state.tile_size, undefined) : undefined;
+    }
+    const HFS_DEFAULT_TILE_SIZE = readHfsDefaultTileSize();
 
     const TILE_STORAGE_KEY = 'short-folder-tile-mode';
+    const TILE_STORAGE_VERSION = 2;
+
     let tileChanging = false;
     let currentTileUri = '';
     let saveTimeout = null;
     let lastSavedTileSize = undefined;
     let isNavigating = false;
+    let tileStore = null;
 
-    function loadTileData() {
+    // ---------- 儲存層（v2，向後相容 v1） ----------
+    function isPlainObject(value) {
+        return !!value && typeof value === 'object' && !Array.isArray(value);
+    }
+
+    function normalizeTileEntry(raw) {
+        if (!isPlainObject(raw)) return null;
+        const size = clampTileSize(raw.size, undefined);
+        if (size === undefined) return null;
+        const time = Number(raw.time);
+        return {
+            size: size,
+            time: isFinite(time) && time > 0 ? time : Date.now(),
+        };
+    }
+
+    function readTileStore() {
+        if (tileStore) return tileStore;
+
+        let parsed = null;
         try {
             const raw = localStorage.getItem(TILE_STORAGE_KEY);
-            if (!raw) return {};
-            return JSON.parse(raw);
-        } catch {
-            return {};
+            if (raw) parsed = JSON.parse(raw);
+        } catch (e) {
+            parsed = null;
+        }
+
+        const entries = {};
+        if (isPlainObject(parsed)) {
+            // v2: { v: 2, entries: { '/path/': { size, time } } }
+            // v1: { '/path/': { size, time } }
+            const source = (parsed.v === TILE_STORAGE_VERSION && isPlainObject(parsed.entries))
+                ? parsed.entries
+                : parsed;
+
+            for (const key of Object.keys(source)) {
+                // 只接受正規化後的資料夾路徑，順手丟掉壞資料。
+                if (typeof key !== 'string' || key.charAt(0) !== '/') continue;
+                const entry = normalizeTileEntry(source[key]);
+                if (entry) entries[key] = entry;
+            }
+        }
+
+        tileStore = { v: TILE_STORAGE_VERSION, entries: entries };
+        return tileStore;
+    }
+
+    function writeTileStore() {
+        if (!tileStore) return;
+        try {
+            localStorage.setItem(TILE_STORAGE_KEY, JSON.stringify(tileStore));
+        } catch (e) {
+            // 配額爆掉或儲存被停用：這次瀏覽階段仍用記憶體中的副本。
         }
     }
 
-    function saveTileData(data) {
-        localStorage.setItem(TILE_STORAGE_KEY, JSON.stringify(data));
+    function wipeTileStore() {
+        tileStore = { v: TILE_STORAGE_VERSION, entries: {} };
+        try {
+            localStorage.removeItem(TILE_STORAGE_KEY);
+        } catch (e) {}
     }
 
+    // ---------- 路徑正規化 ----------
     function getTileModeKey(path) {
         if (!path) return '/';
 
         let raw = String(path);
+        let decoded = false;
 
-        // Strip origin if a full URL was passed.
+        // 完整 URL：只留 path + query。
         try {
             if (/^https?:\/\//i.test(raw)) {
                 const u = new URL(raw);
@@ -46,16 +150,16 @@
             }
         } catch (e) {}
 
-        // API style: /~/api/get_file_list?uri=%2FPictures%2F
-        // Extract and decode the real folder path from the uri query parameter.
+        // API 形式：/~/api/get_file_list?uri=%2FPictures%2F
+        // 優先取出 uri 參數（URLSearchParams 已解碼一次）。
         try {
             const qIndex = raw.indexOf('?');
             if (qIndex !== -1) {
-                const query = raw.slice(qIndex + 1);
-                const params = new URLSearchParams(query);
+                const params = new URLSearchParams(raw.slice(qIndex + 1));
                 const uriParam = params.get('uri');
                 if (uriParam) {
-                    raw = decodeURIComponent(uriParam);
+                    raw = uriParam;
+                    decoded = true;
                 } else {
                     raw = raw.slice(0, qIndex);
                 }
@@ -64,21 +168,27 @@
             raw = raw.split('?')[0];
         }
 
-        // Decode any remaining percent-encoding (path style URIs may be encoded).
-        try {
-            raw = decodeURIComponent(raw);
-        } catch (e) {}
+        // 去掉 hash（查詢字串已在上面處理）。
+        const hashIndex = raw.indexOf('#');
+        if (hashIndex !== -1) raw = raw.slice(0, hashIndex);
 
-        // Normalize leading slash and trailing slash.
+        // 路徑形式可能仍是百分比編碼；只解一次，避免 %25 被重複解碼。
+        if (!decoded) {
+            try {
+                raw = decodeURIComponent(raw);
+            } catch (e) {}
+        }
+
         if (!raw.startsWith('/')) raw = '/' + raw;
         if (!raw.endsWith('/')) raw = raw + '/';
 
-        // Collapse duplicate slashes.
+        // 收斂重複斜線。
         raw = raw.replace(/\/+/g, '/');
 
         return raw;
     }
 
+    // ---------- 尺寸狀態 ----------
     function getTileSizeFromState() {
         if (typeof HFS !== 'undefined' && HFS.state && HFS.state.tile_size !== undefined) {
             return HFS.state.tile_size;
@@ -89,8 +199,11 @@
     function setTileSize(value) {
         if (typeof HFS !== 'undefined' && HFS.state) {
             tileChanging = true;
-            HFS.state.tile_size = value;
-            tileChanging = false;
+            try {
+                HFS.state.tile_size = value;
+            } finally {
+                tileChanging = false;
+            }
         }
     }
 
@@ -103,41 +216,108 @@
         } catch (e) {}
     }
 
+    function syncTileSizeControl(size) {
+        try {
+            const panel = document.getElementById('option-tile-size');
+            if (!panel) return;
+
+            const range = panel.querySelector('input[type="range"]');
+            if (range && String(range.value) !== String(size)) {
+                range.value = String(size);
+            }
+
+            const nodes = panel.querySelectorAll('div, span, label');
+            for (const el of nodes) {
+                if (!/tiles?\s*mode/i.test((el.textContent || '').trim())) continue;
+                // 只改純文字標籤，避免把別人的子元素（圖示、數字 span）洗掉。
+                if (el.children && el.children.length) continue;
+                el.textContent = 'Tiles mode: ' + size;
+                break;
+            }
+        } catch (e) {}
+    }
+
     function getServerDefaultTileSize() {
         if (!ENABLE_TILE_MODE_MEMORY) return undefined;
-        return SERVER_TILE_SIZE;
+        // 預設尺寸就是 HFS config.yaml 的 tile_size；沒有才退回 2。
+        return HFS_DEFAULT_TILE_SIZE !== undefined
+            ? HFS_DEFAULT_TILE_SIZE
+            : TILE_LAST_RESORT_DEFAULT;
+    }
+
+    function applyTileSize(size) {
+        const clamped = clampTileSize(size, undefined);
+        if (clamped === undefined) return undefined;
+
+        if (getTileSizeFromState() !== clamped) {
+            setTileSize(clamped);
+        }
+        applyTileSizeToDOM(clamped);
+        syncTileSizeControl(clamped);
+        return clamped;
+    }
+
+    // ---------- 過期清理 ----------
+    function isTileEntryExpired(entry, now) {
+        if (EXPIRE === Infinity) return false;
+        return (now - entry.time) > EXPIRE;
     }
 
     function cleanExpiredTileData() {
-        if (EXPIRE === Infinity) return;
+        if (EXPIRE === Infinity) return 0;
+
+        const entries = readTileStore().entries;
         const now = Date.now();
-        const data = loadTileData();
-        let changed = false;
-        for (const key in data) {
-            if (now - data[key].time > EXPIRE) {
-                delete data[key];
-                changed = true;
+        let removed = 0;
+
+        for (const key of Object.keys(entries)) {
+            if (isTileEntryExpired(entries[key], now)) {
+                delete entries[key];
+                removed++;
             }
         }
-        if (changed) {
-            saveTileData(data);
-        }
+
+        if (removed) writeTileStore();
+        return removed;
     }
 
-    function scheduleSave() {
-        if (saveTimeout) {
-            clearTimeout(saveTimeout);
+    // ---------- 存 / 讀某個資料夾 ----------
+    function saveTileModeForPath(path, size) {
+        if (!ENABLE_TILE_MODE_MEMORY) return;
+        if (typeof HFS === 'undefined' || !HFS.state) return;
+
+        const value = clampTileSize(size !== undefined ? size : getTileSizeFromState(), undefined);
+        if (value === undefined) return;
+
+        const key = getTileModeKey(path);
+        const entries = readTileStore().entries;
+        const existing = entries[key];
+        const defaultSize = getServerDefaultTileSize();
+
+        // 沒有舊記錄、而且值就等於預設值 → 不需要寫入。
+        // （沒記錄時本來就會套用預設值，避免把每個瀏覽過的資料夾都塞進儲存區。）
+        if (!existing && value === defaultSize) {
+            lastSavedTileSize = value;
+            return;
         }
-        saveTimeout = setTimeout(() => {
-            if (currentTileUri) {
-                const currentSize = getTileSizeFromState();
-                if (currentSize !== undefined && currentSize !== lastSavedTileSize) {
-                    saveTileModeForPath(currentTileUri);
-                    lastSavedTileSize = currentSize;
-                }
-            }
+
+        entries[key] = { size: value, time: Date.now() };
+        writeTileStore();
+        lastSavedTileSize = value;
+    }
+
+    function scheduleSave(delay) {
+        if (saveTimeout) clearTimeout(saveTimeout);
+        saveTimeout = setTimeout(function() {
             saveTimeout = null;
-        }, 300);
+            if (!currentTileUri) return;
+
+            const currentSize = getTileSizeFromState();
+            if (currentSize === undefined) return;
+            if (currentSize === lastSavedTileSize) return;
+
+            saveTileModeForPath(currentTileUri, currentSize);
+        }, delay || 300);
     }
 
     function immediateSave() {
@@ -145,13 +325,13 @@
             clearTimeout(saveTimeout);
             saveTimeout = null;
         }
-        if (currentTileUri) {
-            const currentSize = getTileSizeFromState();
-            if (currentSize !== undefined && currentSize !== lastSavedTileSize) {
-                saveTileModeForPath(currentTileUri);
-                lastSavedTileSize = currentSize;
-            }
-        }
+        if (!currentTileUri) return;
+
+        const currentSize = getTileSizeFromState();
+        if (currentSize === undefined) return;
+        if (currentSize === lastSavedTileSize) return;
+
+        saveTileModeForPath(currentTileUri, currentSize);
     }
 
     function loadTileModeForPath(path) {
@@ -161,120 +341,96 @@
         cleanExpiredTileData();
 
         const key = getTileModeKey(path);
-        const data = loadTileData();
-        const saved = data[key];
+        const entries = readTileStore().entries;
+        const saved = entries[key];
+        const defaultSize = getServerDefaultTileSize();
 
-        const defaultSize = getServerDefaultTileSize() || 2;
-
-        if (saved !== undefined && saved.size !== undefined) {
-            if (EXPIRE !== Infinity && Date.now() - saved.time > EXPIRE) {
-                delete data[key];
-                saveTileData(data);
-                setTileSize(defaultSize);
-                applyTileSizeToDOM(defaultSize);
-                lastSavedTileSize = defaultSize;
-                return;
-            }
-
-            if (ENABLE_TILE_MODE_MEMORY) {
-                data[key].time = Date.now();
-                saveTileData(data);
-            }
-
-            setTileSize(saved.size);
-            applyTileSizeToDOM(saved.size);
+        if (saved) {
+            // 有記錄：套用並刷新時間戳（常用資料夾不會過期）。
+            saved.time = Date.now();
+            writeTileStore();
+            applyTileSize(saved.size);
             lastSavedTileSize = saved.size;
             return;
         }
 
-        setTileSize(defaultSize);
-        applyTileSizeToDOM(defaultSize);
+        applyTileSize(defaultSize);
         lastSavedTileSize = defaultSize;
     }
 
-    function saveTileModeForPath(path) {
-        if (!ENABLE_TILE_MODE_MEMORY) return;
-        if (typeof HFS === 'undefined' || !HFS.state) return;
-
-        const key = getTileModeKey(path);
-        const currentSize = getTileSizeFromState();
-
-        if (currentSize === undefined) return;
-
-        const data = loadTileData();
-        data[key] = {
-            size: currentSize,
-            time: Date.now()
-        };
-        saveTileData(data);
-        lastSavedTileSize = currentSize;
+    function forgetTileModeForPath(path) {
+        const key = getTileModeKey(path || currentTileUri || location.pathname);
+        const entries = readTileStore().entries;
+        if (!entries[key]) return false;
+        delete entries[key];
+        writeTileStore();
+        return true;
     }
 
+    // ---------- 初始化記憶模組 ----------
     function initTileModeModule() {
-        if (!ENABLE_TILE_MODE_MEMORY) {
-            // Do not leave stale per-folder data that would silently reapply
-            // if the switch is turned back on.
-            try { localStorage.removeItem(TILE_STORAGE_KEY); } catch (e) {}
-            return;
-        }
-        if (typeof HFS === 'undefined' || !HFS.watchState) return;
+        if (!ENABLE_TILE_MODE_MEMORY) return;
+        if (typeof HFS === 'undefined' || typeof HFS.watchState !== 'function') return;
+
+        readTileStore();
+        cleanExpiredTileData();
 
         setTimeout(function() {
-            const currentUri = HFS.state ? HFS.state.uri : location.pathname;
-            if (currentUri) {
-                const path = currentUri.split('?')[0];
-                currentTileUri = getTileModeKey(currentUri);
-                loadTileModeForPath(currentUri);
+            if (typeof HFS === 'undefined' || !HFS.state) return;
 
-                const currentSize = getTileSizeFromState();
-                if (currentSize !== undefined) {
-                    lastSavedTileSize = currentSize;
-                }
-            }
+            const currentUri = HFS.state.uri || location.pathname;
+            if (!currentUri) return;
+
+            currentTileUri = getTileModeKey(currentUri);
+            loadTileModeForPath(currentUri);
+
+            const currentSize = getTileSizeFromState();
+            if (currentSize !== undefined) lastSavedTileSize = currentSize;
         }, 100);
 
         HFS.watchState('uri', function(uri) {
             if (!uri) return;
 
             const newKey = getTileModeKey(uri);
-
             if (currentTileUri === newKey) return;
 
             isNavigating = true;
 
+            // 先存舊資料夾，再載入新資料夾。
             immediateSave();
-
             currentTileUri = newKey;
-
             loadTileModeForPath(uri);
 
             const currentSize = getTileSizeFromState();
-            if (currentSize !== undefined) {
-                lastSavedTileSize = currentSize;
-            }
+            if (currentSize !== undefined) lastSavedTileSize = currentSize;
 
-            setTimeout(() => {
+            setTimeout(function() {
                 isNavigating = false;
             }, 300);
         });
 
         HFS.watchState('tile_size', function(value) {
-            if (!ENABLE_TILE_MODE_MEMORY) return;
             if (tileChanging) return;
-            if (!currentTileUri) return;
-            if (isNavigating) return;
+            if (!currentTileUri || isNavigating) return;
 
-            if (value !== undefined) {
-                applyTileSizeToDOM(value);
-            }
+            const size = clampTileSize(value, undefined);
+            if (size === undefined) return;
 
-            scheduleSave();
+            // 原生滑桿 / 其他外掛改動了尺寸：同步 UI 並排程寫入。
+            applyTileSizeToDOM(size);
+            syncTileSizeControl(size);
+
+            if (size !== lastSavedTileSize) scheduleSave();
         });
 
-        window.addEventListener('beforeunload', function() {
-            immediateSave();
+        // 關頁 / 切到背景（手機）前落地，避免最後一次調整消失。
+        window.addEventListener('beforeunload', immediateSave);
+        window.addEventListener('pagehide', immediateSave);
+        document.addEventListener('visibilitychange', function() {
+            if (document.visibilityState === 'hidden') immediateSave();
         });
     }
+
 
     const style = document.createElement('style')
     style.textContent = `
@@ -770,41 +926,89 @@
         }
     }
 
+    function setTileSizeViaApi(size, options) {
+        const opts = options || {};
+        const applied = applyTileSize(size);
+        if (applied === undefined) return undefined;
+
+        if (ENABLE_TILE_MODE_MEMORY && currentTileUri) {
+            if (opts.remember === false) {
+                // 只是套用（例如剛載入資料夾），不要寫回記憶。
+                lastSavedTileSize = applied;
+            } else {
+                saveTileModeForPath(currentTileUri, applied);
+            }
+        }
+        return applied;
+    }
+
+    function stepTileSize(delta) {
+        const fallback = getServerDefaultTileSize() ?? TILE_LAST_RESORT_DEFAULT;
+        const current = clampTileSize(getTileSizeFromState(), fallback);
+        return setTileSizeViaApi(current + (Number(delta) || 0));
+    }
+
+    function resetTileSize() {
+        const key = currentTileUri || getTileModeKey(location.pathname);
+        const entries = readTileStore().entries;
+        if (entries[key]) {
+            delete entries[key];
+            writeTileStore();
+        }
+
+        const size = getServerDefaultTileSize();
+        applyTileSize(size);
+        lastSavedTileSize = size;
+        return size;
+    }
+
     function init() {
         initTileModeModule();
         lastMode = checkMode()
 
         if (typeof HFS !== 'undefined') {
-            HFS.short = {
-                reload: function() {
-                    fileData = null;
-                    if (typeof HFS.reloadList === 'function') {
-                        HFS.reloadList();
-                    }
-                    setTimeout(() => {
-                        fileData = getFileData();
-                        updateAll();
-                    }, 100);
+            // 先保留其他外掛（例如 Hotkey）已放在 HFS.short 上的東西，再合併自己的。
+            HFS.short = HFS.short || {};
+
+            HFS.short.reload = function() {
+                fileData = null;
+                if (typeof HFS.reloadList === 'function') {
+                    HFS.reloadList();
                 }
+                setTimeout(() => {
+                    fileData = getFileData();
+                    updateAll();
+                }, 100);
             };
 
             if (ENABLE_TILE_MODE_MEMORY) {
                 HFS.short.tile = {
-                    save: function() {
-                        if (currentTileUri) {
-                            immediateSave();
-                        }
+                    // ---- 新 API ----
+                    getSize: function() {
+                        return getTileSizeFromState();
                     },
+                    setSize: setTileSizeViaApi,
+                    step: stepTileSize,
+                    reset: resetTileSize,
+                    forget: forgetTileModeForPath,
+                    clear: wipeTileStore,
+                    sync: function() {
+                        const size = getTileSizeFromState();
+                        applyTileSizeToDOM(size);
+                        syncTileSizeControl(size);
+                        return size;
+                    },
+
+                    // ---- 相容舊 API（Hotkey / Console）----
+                    save: immediateSave,
                     load: function(path) {
-                        loadTileModeForPath(path || location.pathname);
+                        loadTileModeForPath(path || currentTileUri || location.pathname);
                     },
                     cleanExpired: cleanExpiredTileData,
                     getStorage: function() {
-                        return loadTileData();
+                        return readTileStore().entries;
                     },
-                    getServerDefault: function() {
-                        return getServerDefaultTileSize();
-                    },
+                    getServerDefault: getServerDefaultTileSize,
                     refresh: function() {
                         if (currentTileUri) {
                             loadTileModeForPath(currentTileUri);
