@@ -1,4 +1,4 @@
-exports.repo = "Hug3O/Short-plus"
+exports.repo = "Hug3O/Tiles-plus"
 exports.version = 2.2
 exports.description = "Improves sorted views by showing time or extension instead of size; also remembers tile size per folder (tile mode memory merged from Hotkey; formerly Short-plus)"
 exports.apiRequired = 9.6
